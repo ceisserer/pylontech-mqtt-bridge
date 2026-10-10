@@ -1,0 +1,24 @@
+{
+  "loglevel": "INFO",
+  "port": "/dev/ttyUSB0",
+  "baudrate": 9600,
+  "battery_count": 0,
+  "interval": 2,
+  "export_file_abspath": "/run/pylon2mqtt/pylon.json",
+  "export_mqtt_server": "127.0.0.1",
+  "export_mqtt_port": 1883,
+  "export_mqtt_user": "",
+  "export_mqtt_password": "",
+  "export_mqtt_basetopic": "Pylon",
+  "export_mqtt_status_topic": "status",
+  "export_mqtt_topics": {
+    "PowerW": "Calculated.Power_W",
+    "RemCapAh": "Calculated.RemainCapacity_Ah",
+    "RemPerc": "Calculated.Remain_Percent",
+    "FullChargeReq": "ChargeDischargeManagement[0].StatusFullChargeRequired",
+    "Voltage": "Analog[0].Voltage",
+    "CellVoltages": "Analog[0].CellVoltages",
+    "Cells/{0+1}": "Analog[0].CellVoltages[*]",
+    "Calculated": "Calculated"
+  }
+}

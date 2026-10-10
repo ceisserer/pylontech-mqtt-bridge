@@ -1,0 +1,18 @@
+# compiled binary
+/pylon2mqtt
+*.o
+
+# debian package build output
+/dpkg/content/usr/
+/dpkg/content/etc/
+/dpkg/content/lib/
+/dpkg/content/debian/pylon2mqtt/
+/dpkg/content/debian/.debhelper/
+/dpkg/content/debian/files
+/dpkg/content/debian/*.substvars
+/dpkg/content/debian/*.log
+/dpkg/*.deb
+/dpkg/*.buildinfo
+/dpkg/*.changes
+/dpkg/*.dsc
+/dpkg/*.tar.*

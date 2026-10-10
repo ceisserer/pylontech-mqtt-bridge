@@ -1,0 +1,10 @@
+Source: pylon2mqtt
+Priority: optional
+Maintainer: Clemens Eisserer <ceisserer@gmail.com>
+Build-Depends: debhelper (>= 13), libmosquitto-dev, libcjson-dev
+Standards-Version: 4.5.1
+
+Package: pylon2mqtt
+Architecture: any
+Depends: ${misc:Depends}, ${shlibs:Depends}
+Description: Pylontech battery (RS485) to MQTT bridge (native C).

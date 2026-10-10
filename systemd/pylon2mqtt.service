@@ -1,0 +1,18 @@
+[Unit]
+Description=pylon2mqtt - Pylontech battery to MQTT bridge
+After=syslog.target network-online.target mosquitto.service
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/pylon2mqtt /etc/pylon2mqtt/pylon.json
+# for "export_file_abspath": "/run/pylon2mqtt/pylon.json"
+RuntimeDirectory=pylon2mqtt
+StandardOutput=null
+StandardError=journal
+Restart=on-failure
+RestartSec=5
+# no restart on config error (10) or logging error (20)
+RestartPreventExitStatus=10 20
+
+[Install]
+WantedBy=multi-user.target
