@@ -29,6 +29,9 @@
  *
  * SPDX-License-Identifier: GPL-3.0-or-later
  *
+ * The battery communication is in libpylontech (pylontech.c), which is
+ * compiled into this program.
+ *
  * Dependencies: libmosquitto, cJSON
  *
  * Usage: pylon2mqtt [config_file]   (default: /etc/pylon2mqtt/pylon.json)
@@ -38,29 +41,22 @@
 
 #include <ctype.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <math.h>
-#include <netdb.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
-#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/ioctl.h>
-#include <sys/socket.h>
 #include <sys/stat.h>
-#include <termios.h>
 #include <time.h>
 #include <unistd.h>
 
 #include <cjson/cJSON.h>
 #include <mosquitto.h>
+
+#include "pylontech.h"
 
 #define DEFAULT_CONFIG_FILE "/etc/pylon2mqtt/pylon.json"
 
@@ -78,39 +74,12 @@
 #define LVL_ERROR 40
 #define LVL_CRITICAL 50
 
-/* protocol */
-#define PROTOCOL_VERSION 0x20
-#define CID1_BATTERY 0x46
-#define CID2_GET_ANALOG_VALUE 0x42
-#define CID2_GET_ALARM_INFO 0x44
-#define CID2_GET_SYSTEM_PARAMETER 0x47
-#define CID2_GET_CHARGE_MANAGEMENT 0x92
-#define CID2_GET_SERIAL_NUMBER 0x93
-
-#define FRAME_MAX 1024
-#define MAX_BATTERIES 16
-#define SERIAL_NUMBER_RETRIES 3
-#define SOCKET_CONNECT_TIMEOUT_MS 5000
-
 /* topic paths */
 #define IDX_WILDCARD (-1)
 #define MAX_SEG_INDEXES 4
 #define MAX_WILDCARDS 8
 
 static volatile sig_atomic_t g_stop = 0;
-
-/* description of the last protocol error, for the caller to log */
-static char g_error[256];
-
-static void set_error(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
-
-static void set_error(const char *fmt, ...)
-{
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(g_error, sizeof(g_error), fmt, ap);
-    va_end(ap);
-}
 
 /*
  * Logging (format and rotation like Python's RotatingFileHandler,
@@ -266,118 +235,6 @@ static void sb_clear(sbuf_t *sb)
     sb->len = 0;
     if (sb->buf)
         sb->buf[0] = '\0';
-}
-
-/*
- * Numbers with Python semantics: the data tree holds ints and floats like
- * the Python library, floats are formatted like Python's repr() (e.g. "6.0").
- */
-
-/* equivalent of Python's repr(float) for finite values */
-static void format_py_float(double v, char *out, size_t sz)
-{
-    char buf[40];
-    int prec;
-
-    if (!isfinite(v)) {
-        snprintf(out, sz, "%s", isnan(v) ? "nan" : (v > 0 ? "inf" : "-inf"));
-        return;
-    }
-    if (v == 0.0) {
-        snprintf(out, sz, "%s", signbit(v) ? "-0.0" : "0.0");
-        return;
-    }
-
-    /* shortest representation that round-trips */
-    for (prec = 1; prec <= 17; prec++) {
-        snprintf(buf, sizeof(buf), "%.*e", prec - 1, v);
-        if (strtod(buf, NULL) == v)
-            break;
-    }
-
-    /* split "-d.ddde+XX" into sign, digits and exponent */
-    const char *p = buf;
-    bool neg = false;
-    if (*p == '-') {
-        neg = true;
-        p++;
-    }
-    char digits[24];
-    int nd = 0;
-    for (; *p && *p != 'e'; p++)
-        if (*p != '.')
-            digits[nd++] = *p;
-    while (nd > 1 && digits[nd - 1] == '0')
-        nd--;
-    digits[nd] = '\0';
-    int exp10 = atoi(p + 1);
-    int decpt = exp10 + 1; /* value = 0.digits * 10^decpt */
-
-    char res[64];
-    int pos = 0;
-    if (neg)
-        res[pos++] = '-';
-    if (decpt <= -4 || decpt > 16) {
-        res[pos++] = digits[0];
-        if (nd > 1) {
-            res[pos++] = '.';
-            memcpy(res + pos, digits + 1, (size_t)nd - 1);
-            pos += nd - 1;
-        }
-        pos += snprintf(res + pos, sizeof(res) - (size_t)pos, "e%c%02d", exp10 < 0 ? '-' : '+',
-                        abs(exp10));
-    } else if (decpt <= 0) {
-        res[pos++] = '0';
-        res[pos++] = '.';
-        for (int i = 0; i < -decpt; i++)
-            res[pos++] = '0';
-        memcpy(res + pos, digits, (size_t)nd);
-        pos += nd;
-    } else if (decpt >= nd) {
-        memcpy(res + pos, digits, (size_t)nd);
-        pos += nd;
-        for (int i = nd; i < decpt; i++)
-            res[pos++] = '0';
-        res[pos++] = '.';
-        res[pos++] = '0';
-    } else {
-        memcpy(res + pos, digits, (size_t)decpt);
-        pos += decpt;
-        res[pos++] = '.';
-        memcpy(res + pos, digits + decpt, (size_t)(nd - decpt));
-        pos += nd - decpt;
-    }
-    res[pos] = '\0';
-    snprintf(out, sz, "%s", res);
-}
-
-/* equivalent of Python's round(v, ndigits) (correctly rounded, half to even) */
-static double py_round(double v, int ndigits)
-{
-    char buf[400];
-
-    if (!isfinite(v))
-        return v;
-    snprintf(buf, sizeof(buf), "%.*f", ndigits, v);
-    return strtod(buf, NULL);
-}
-
-/* floats are stored as raw JSON (Python formatting), ints as cJSON numbers */
-static cJSON *float_item(double v)
-{
-    char buf[40];
-    format_py_float(v, buf, sizeof(buf));
-    return cJSON_CreateRaw(buf);
-}
-
-static void add_float(cJSON *obj, const char *name, double v)
-{
-    cJSON_AddItemToObject(obj, name, float_item(v));
-}
-
-static void add_int(cJSON *obj, const char *name, long v)
-{
-    cJSON_AddNumberToObject(obj, name, (double)v);
 }
 
 /*
@@ -807,7 +664,7 @@ static bool config_load(config_t *cfg, const char *file)
     if (!cfg_string(r, file, "logfile", NULL, &cfg->logfile) ||
         !cfg_string(r, file, "port", NULL, &cfg->port) ||
         !cfg_int(r, file, "baudrate", 9600, 300, 921600, &cfg->baudrate) ||
-        !cfg_int(r, file, "battery_count", 0, 0, MAX_BATTERIES, &cfg->battery_count) ||
+        !cfg_int(r, file, "battery_count", 0, 0, PYLON_MAX_BATTERIES, &cfg->battery_count) ||
         !cfg_int(r, file, "group", 0, 0, 7, &cfg->group) ||
         !cfg_number(r, file, "interval", 2, 0, 86400, &cfg->interval) ||
         !cfg_number(r, file, "timeout", 1, 0.05, 60, &cfg->timeout) ||
@@ -869,808 +726,6 @@ static void config_free(config_t *cfg)
     }
     free(cfg->mqtt_topics);
     cJSON_Delete(cfg->root);
-}
-
-/*
- * Transport: serial port (8N1, RTS as transmit enable like python-pylontech)
- * or TCP for RS485 to Ethernet adapters ("socket://host:port")
- */
-
-typedef struct {
-    int fd;
-    bool is_serial;
-    uint8_t rx[512];
-    size_t rx_pos;
-    size_t rx_len;
-} transport_t;
-
-#define RX_TIMEOUT (-1)
-#define RX_STOP (-2)
-#define RX_ERROR (-3)
-
-static double now_monotonic(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
-}
-
-static speed_t baud_to_speed(int baud)
-{
-    switch (baud) {
-    case 300: return B300;
-    case 600: return B600;
-    case 1200: return B1200;
-    case 2400: return B2400;
-    case 4800: return B4800;
-    case 9600: return B9600;
-    case 19200: return B19200;
-    case 38400: return B38400;
-    case 57600: return B57600;
-    case 115200: return B115200;
-    case 230400: return B230400;
-    case 460800: return B460800;
-    case 921600: return B921600;
-    default: return 0;
-    }
-}
-
-static int serial_open(const char *port, int baudrate)
-{
-    speed_t speed = baud_to_speed(baudrate);
-    if (!speed) {
-        set_error("unsupported baudrate %d", baudrate);
-        return -1;
-    }
-
-    int fd = open(port, O_RDWR | O_NOCTTY | O_NONBLOCK | O_CLOEXEC);
-    if (fd < 0) {
-        set_error("%s", strerror(errno));
-        return -1;
-    }
-
-    struct termios tio;
-    if (tcgetattr(fd, &tio) != 0) {
-        set_error("could not configure port: %s", strerror(errno));
-        close(fd);
-        return -1;
-    }
-
-    cfmakeraw(&tio);
-    tio.c_cflag |= CLOCAL | CREAD;
-    tio.c_cflag &= ~(CSIZE | CSTOPB | PARENB | PARODD | CMSPAR | CRTSCTS);
-    tio.c_cflag |= CS8;
-    tio.c_iflag &= ~(IXON | IXOFF | IXANY);
-    tio.c_cc[VMIN] = 0;
-    tio.c_cc[VTIME] = 0;
-    cfsetispeed(&tio, speed);
-    cfsetospeed(&tio, speed);
-
-    if (tcsetattr(fd, TCSANOW, &tio) != 0) {
-        set_error("could not configure port: %s", strerror(errno));
-        close(fd);
-        return -1;
-    }
-
-    /* DTR on, RTS (transmit enable) off = receive; errors ignored, e.g. on ptys */
-    int bits = TIOCM_DTR;
-    ioctl(fd, TIOCMBIS, &bits);
-    bits = TIOCM_RTS;
-    ioctl(fd, TIOCMBIC, &bits);
-
-    tcflush(fd, TCIOFLUSH);
-    return fd;
-}
-
-static int socket_open(const char *hostport)
-{
-    char host[256];
-    const char *colon = strrchr(hostport, ':');
-    size_t n = colon ? (size_t)(colon - hostport) : 0;
-
-    if (n == 0 || n >= sizeof(host) || !colon[1]) {
-        set_error("invalid socket address (expected socket://host:port)");
-        return -1;
-    }
-    memcpy(host, hostport, n);
-    host[n] = '\0';
-    if (host[0] == '[' && host[n - 1] == ']') {
-        memmove(host, host + 1, n - 2);
-        host[n - 2] = '\0';
-    }
-
-    struct addrinfo hints = { .ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM };
-    struct addrinfo *res, *ai;
-    int rc = getaddrinfo(host, colon + 1, &hints, &res);
-    if (rc != 0) {
-        set_error("could not resolve host: %s", gai_strerror(rc));
-        return -1;
-    }
-
-    int fd = -1, err = 0;
-    for (ai = res; ai; ai = ai->ai_next) {
-        fd = socket(ai->ai_family, ai->ai_socktype | SOCK_NONBLOCK | SOCK_CLOEXEC,
-                    ai->ai_protocol);
-        if (fd < 0) {
-            err = errno;
-            continue;
-        }
-        if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0)
-            break;
-        err = errno;
-        if (err == EINPROGRESS) {
-            struct pollfd pfd = { .fd = fd, .events = POLLOUT };
-            if (poll(&pfd, 1, SOCKET_CONNECT_TIMEOUT_MS) == 1) {
-                socklen_t l = sizeof(err);
-                if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &l) != 0)
-                    err = errno;
-                if (err == 0)
-                    break;
-            } else {
-                err = ETIMEDOUT;
-            }
-        }
-        close(fd);
-        fd = -1;
-    }
-    freeaddrinfo(res);
-
-    if (fd < 0) {
-        set_error("could not connect: %s", strerror(err));
-        return -1;
-    }
-    int one = 1;
-    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-    return fd;
-}
-
-static bool transport_open(transport_t *tp, const config_t *cfg)
-{
-    const char *addr = strip_prefix(cfg->port, "socket://");
-
-    tp->is_serial = addr == cfg->port;
-    tp->rx_pos = tp->rx_len = 0;
-    tp->fd = tp->is_serial ? serial_open(cfg->port, cfg->baudrate) : socket_open(addr);
-    if (tp->fd < 0)
-        return false;
-    log_info("Opened %s", cfg->port);
-    return true;
-}
-
-static void transport_close(transport_t *tp)
-{
-    if (tp->fd >= 0)
-        close(tp->fd);
-    tp->fd = -1;
-}
-
-/* discard pending input */
-static void transport_flush(transport_t *tp)
-{
-    uint8_t buf[256];
-
-    if (tp->is_serial)
-        tcflush(tp->fd, TCIFLUSH);
-    while (read(tp->fd, buf, sizeof(buf)) > 0)
-        ;
-    tp->rx_pos = tp->rx_len = 0;
-}
-
-static bool transport_write(transport_t *tp, const char *data, size_t len)
-{
-    int rts = TIOCM_RTS;
-    size_t off = 0;
-    bool ok = true;
-
-    if (tp->is_serial)
-        ioctl(tp->fd, TIOCMBIS, &rts);
-    while (off < len) {
-        ssize_t n = write(tp->fd, data + off, len - off);
-        if (n < 0) {
-            if (errno == EINTR)
-                continue;
-            if (errno == EAGAIN) {
-                struct pollfd pfd = { .fd = tp->fd, .events = POLLOUT };
-                if (poll(&pfd, 1, 1000) == 0) {
-                    set_error("write timeout");
-                    ok = false;
-                    break;
-                }
-                continue;
-            }
-            set_error("write failed: %s", strerror(errno));
-            ok = false;
-            break;
-        }
-        off += (size_t)n;
-    }
-    if (tp->is_serial) {
-        tcdrain(tp->fd);
-        ioctl(tp->fd, TIOCMBIC, &rts);
-    }
-    return ok;
-}
-
-static int transport_read_byte(transport_t *tp, double deadline)
-{
-    if (tp->rx_pos < tp->rx_len)
-        return tp->rx[tp->rx_pos++];
-
-    for (;;) {
-        if (g_stop)
-            return RX_STOP;
-        double left = deadline - now_monotonic();
-        if (left <= 0)
-            return RX_TIMEOUT;
-
-        struct pollfd pfd = { .fd = tp->fd, .events = POLLIN };
-        int r = poll(&pfd, 1, (int)ceil(left * 1000.0));
-        if (r < 0) {
-            if (errno == EINTR)
-                continue;
-            set_error("poll failed: %s", strerror(errno));
-            return RX_ERROR;
-        }
-        if (r == 0)
-            return RX_TIMEOUT;
-
-        ssize_t n = read(tp->fd, tp->rx, sizeof(tp->rx));
-        if (n < 0) {
-            if (errno == EINTR || errno == EAGAIN)
-                continue;
-            set_error("read failed: %s", strerror(errno));
-            return RX_ERROR;
-        }
-        if (n == 0) {
-            set_error("connection closed (device disconnected?)");
-            return RX_ERROR;
-        }
-        tp->rx_pos = 1;
-        tp->rx_len = (size_t)n;
-        return tp->rx[0];
-    }
-}
-
-/*
- * Protocol: frames are "~" + ASCII hex + "\r":
- * VER ADR CID1 CID2/RTN LENGTH INFO CHKSUM
- */
-
-static unsigned long hex_value(const char *s, size_t n)
-{
-    unsigned long v = 0;
-    for (size_t i = 0; i < n; i++) {
-        char c = s[i];
-        v = v * 16 + (unsigned long)(isdigit((unsigned char)c) ? c - '0' : (toupper((unsigned char)c) - 'A' + 10));
-    }
-    return v;
-}
-
-static unsigned frame_checksum(const char *s, size_t n)
-{
-    unsigned sum = 0;
-    for (size_t i = 0; i < n; i++)
-        sum += (unsigned char)s[i];
-    return (~sum + 1) & 0xffff;
-}
-
-/* LENGTH field: 12 bit LENID plus 4 bit LCHKSUM */
-static unsigned length_field(unsigned lenid)
-{
-    unsigned cs = (lenid & 0xf) + ((lenid >> 4) & 0xf) + ((lenid >> 8) & 0xf);
-    cs = ((~cs) & 0xf) + 1;
-    return ((cs << 12) + lenid) & 0xffff;
-}
-
-static const char *rtn_name(unsigned rtn)
-{
-    switch (rtn) {
-    case 0x01: return "VER error";
-    case 0x02: return "CHKSUM error";
-    case 0x03: return "LCHKSUM error";
-    case 0x04: return "CID2 invalid";
-    case 0x05: return "command format error";
-    case 0x06: return "invalid data";
-    case 0x90: return "ADR error";
-    case 0x91: return "communication error";
-    default: return "unknown error";
-    }
-}
-
-/* receive the next "~...\r" frame, without "~" and "\r" */
-static int receive_frame(transport_t *tp, char *buf, size_t size, size_t *len, double timeout)
-{
-    double deadline = now_monotonic() + timeout;
-    size_t n = 0;
-    int c;
-
-    do {
-        c = transport_read_byte(tp, deadline);
-        if (c < 0)
-            return c;
-    } while (c != '~');
-
-    deadline = now_monotonic() + timeout;
-    for (;;) {
-        c = transport_read_byte(tp, deadline);
-        if (c < 0)
-            return c;
-        if (c == '\r')
-            break;
-        if (c == '~') {
-            n = 0; /* start over at the new start byte */
-            continue;
-        }
-        if (n + 1 >= size) {
-            set_error("response too long");
-            return RX_ERROR;
-        }
-        buf[n++] = (char)c;
-    }
-    buf[n] = '\0';
-    *len = n;
-    return 0;
-}
-
-static bool parse_response(const char *f, size_t len, int *adr, char *payload, size_t size,
-                           size_t *plen)
-{
-    if (len < 16) {
-        set_error("response too short (%zu characters)", len);
-        return false;
-    }
-    for (size_t i = 0; i < len; i++) {
-        if (!isxdigit((unsigned char)f[i])) {
-            set_error("invalid character in response");
-            return false;
-        }
-    }
-    unsigned chksum = (unsigned)hex_value(f + len - 4, 4);
-    unsigned calc = frame_checksum(f, len - 4);
-    if (chksum != calc) {
-        set_error("checksum error: expected %04X, received %04X", calc, chksum);
-        return false;
-    }
-
-    unsigned cid1 = (unsigned)hex_value(f + 4, 2);
-    unsigned rtn = (unsigned)hex_value(f + 6, 2);
-    size_t lenid = hex_value(f + 8, 4) & 0x0fff;
-    if (cid1 != CID1_BATTERY) {
-        set_error("unexpected CID1 0x%02X in response", cid1);
-        return false;
-    }
-    if (rtn != 0) {
-        set_error("battery returned error 0x%02X (%s)", rtn, rtn_name(rtn));
-        return false;
-    }
-    if (12 + lenid > len - 4 || lenid >= size) {
-        set_error("response truncated (LENGTH %zu, received %zu)", lenid, len - 16);
-        return false;
-    }
-    *adr = (int)hex_value(f + 2, 2);
-    memcpy(payload, f + 12, lenid);
-    payload[lenid] = '\0';
-    *plen = lenid;
-    return true;
-}
-
-/* send a command and receive the response payload (INFO); on error see g_error */
-static bool pylon_request(transport_t *tp, double timeout, int adr, int cid2, const char *info,
-                          int *resp_adr, char *payload, size_t size, size_t *plen)
-{
-    char body[128], cmd[160];
-    static char frame[FRAME_MAX];
-    size_t len;
-
-    int blen = snprintf(body, sizeof(body), "%02X%02X%02X%02X%04X%s", PROTOCOL_VERSION, adr,
-                        CID1_BATTERY, cid2, length_field((unsigned)strlen(info)), info);
-    int clen = snprintf(cmd, sizeof(cmd), "~%s%04X\r", body, frame_checksum(body, (size_t)blen));
-
-    transport_flush(tp);
-    log_debug("-> %.*s", clen - 1, cmd);
-    if (!transport_write(tp, cmd, (size_t)clen))
-        return false;
-
-    for (;;) {
-        int rc = receive_frame(tp, frame, sizeof(frame), &len, timeout);
-        if (rc == RX_TIMEOUT)
-            set_error("no response from address %d (timeout)", adr);
-        if (rc == RX_STOP)
-            set_error("stopped");
-        if (rc != 0)
-            return false;
-        log_debug("<- ~%s", frame);
-        /* adapters without echo suppression */
-        if (len == (size_t)clen - 2 && memcmp(frame, cmd + 1, len) == 0)
-            continue;
-        break;
-    }
-    return parse_response(frame, len, resp_adr, payload, size, plen);
-}
-
-/*
- * Payload decoding (field names and scaling like python-pylontech)
- */
-
-typedef struct {
-    const char *p;
-    size_t len;
-    size_t pos;
-    bool err;
-} hexrd_t;
-
-static unsigned long hr_uint(hexrd_t *r, int nbytes)
-{
-    size_t n = (size_t)nbytes * 2;
-    if (r->pos + n > r->len) {
-        r->err = true;
-        r->pos = r->len;
-        return 0;
-    }
-    unsigned long v = hex_value(r->p + r->pos, n);
-    r->pos += n;
-    return v;
-}
-
-static long hr_int16(hexrd_t *r)
-{
-    unsigned long v = hr_uint(r, 2);
-    return v & 0x8000 ? (long)v - 0x10000 : (long)v;
-}
-
-static bool hr_available(const hexrd_t *r, int nbytes)
-{
-    return r->pos + (size_t)nbytes * 2 <= r->len;
-}
-
-/* ASCII string, trailing NULs stripped, non-printable characters replaced */
-static void hr_ascii(hexrd_t *r, int nbytes, char *out, size_t size)
-{
-    size_t n = 0;
-    for (int i = 0; i < nbytes; i++) {
-        unsigned long c = hr_uint(r, 1);
-        if (n + 1 < size)
-            out[n++] = (char)c;
-    }
-    while (n > 0 && out[n - 1] == '\0')
-        n--;
-    for (size_t i = 0; i < n; i++)
-        if ((unsigned char)out[i] < 0x20 || (unsigned char)out[i] >= 0x7f)
-            out[i] = '?';
-    out[n] = '\0';
-}
-
-static double cell_voltage(long v) { return (double)v / 1000.0; }
-static double module_voltage(unsigned long v) { return (double)v / 1000.0; }
-static double module_current(long v) { return (double)v / 10.0; }
-static double temperature(long v) { return (double)(v - 2731) / 10.0; }
-
-static const char *alarm_name(unsigned long v)
-{
-    switch (v) {
-    case 0: return "Ok";
-    case 1: return "BelowLimit";
-    case 2: return "AboveLimit";
-    default: return "OtherError";
-    }
-}
-
-typedef struct {
-    double voltage;
-    double current;
-    double remain;
-    double total;
-    double cell_min;
-    double cell_max;
-    int cells;
-} analog_summary_t;
-
-static cJSON *decode_analog_value(const char *payload, size_t len, int adr, analog_summary_t *sum)
-{
-    hexrd_t r = { payload, len, 0, false };
-    cJSON *o = cJSON_CreateObject();
-
-    add_int(o, "ADR", adr);
-    add_int(o, "InfoFlag", (long)hr_uint(&r, 1));
-    add_int(o, "CommandValue", (long)hr_uint(&r, 1));
-    int cells = (int)hr_uint(&r, 1);
-    add_int(o, "CellCount", cells);
-    cJSON *arr = cJSON_AddArrayToObject(o, "CellVoltages");
-    sum->cells = 0;
-    for (int i = 0; i < cells && !r.err; i++) {
-        double v = cell_voltage(hr_int16(&r));
-        cJSON_AddItemToArray(arr, float_item(v));
-        if (sum->cells++ == 0 || v < sum->cell_min)
-            sum->cell_min = v;
-        if (sum->cells == 1 || v > sum->cell_max)
-            sum->cell_max = v;
-    }
-    int temps = (int)hr_uint(&r, 1);
-    add_int(o, "TemperatureCount", temps);
-    arr = cJSON_AddArrayToObject(o, "Temperatures");
-    for (int i = 0; i < temps && !r.err; i++)
-        cJSON_AddItemToArray(arr, float_item(temperature(hr_int16(&r))));
-    sum->current = module_current(hr_int16(&r));
-    sum->voltage = module_voltage(hr_uint(&r, 2));
-    sum->remain = (double)hr_uint(&r, 2) / 1000.0;
-    bool large = hr_uint(&r, 1) == 4; /* user defined item count: 4 = 3 byte capacities */
-    sum->total = (double)hr_uint(&r, 2) / 1000.0;
-    long cycles = (long)hr_uint(&r, 2);
-    if (large) {
-        sum->remain = (double)hr_uint(&r, 3) / 1000.0;
-        sum->total = (double)hr_uint(&r, 3) / 1000.0;
-    }
-    if (r.err) {
-        set_error("analog value response too short (%zu characters)", len);
-        cJSON_Delete(o);
-        return NULL;
-    }
-    add_float(o, "Current", sum->current);
-    add_float(o, "Voltage", sum->voltage);
-    add_float(o, "RemainCapacity", sum->remain);
-    cJSON_AddStringToObject(o, "CapDetect", large ? ">65Ah" : "<=65Ah");
-    add_float(o, "ModuleTotalCapacity", sum->total);
-    add_int(o, "CycleNumber", cycles);
-    return o;
-}
-
-static cJSON *decode_charge_management(const char *payload, size_t len, int adr)
-{
-    hexrd_t r = { payload, len, 0, false };
-
-    if (len < 20) {
-        set_error("charge/discharge management response too short (%zu characters)", len);
-        return NULL;
-    }
-    cJSON *o = cJSON_CreateObject();
-    add_int(o, "ADR", adr);
-    add_int(o, "CommandValue", (long)hr_uint(&r, 1));
-    add_float(o, "ChargeVoltage", module_voltage(hr_uint(&r, 2)));
-    add_float(o, "DischargeVoltage", module_voltage(hr_uint(&r, 2)));
-    add_float(o, "ChargeCurrent", module_current(hr_int16(&r)));
-    add_float(o, "DischargeCurrent", module_current(hr_int16(&r)));
-    unsigned long status = hr_uint(&r, 1);
-    cJSON_AddBoolToObject(o, "StatusChargeEnable", status & 0x80);
-    cJSON_AddBoolToObject(o, "StatusDischargeEnable", status & 0x40);
-    cJSON_AddBoolToObject(o, "StatusChargeImmediately1", status & 0x20);
-    cJSON_AddBoolToObject(o, "StatusChargeImmediately2", status & 0x10);
-    cJSON_AddBoolToObject(o, "StatusFullChargeRequired", status & 0x08);
-    return o;
-}
-
-static cJSON *decode_alarm_info(const char *payload, size_t len, int adr)
-{
-    hexrd_t r = { payload, len, 0, false };
-    cJSON *o = cJSON_CreateObject();
-
-    add_int(o, "ADR", adr);
-    add_int(o, "InfoFlag", (long)hr_uint(&r, 1));
-    add_int(o, "CommandValue", (long)hr_uint(&r, 1));
-    int cells = (int)hr_uint(&r, 1);
-    add_int(o, "CellCount", cells);
-    cJSON *arr = cJSON_AddArrayToObject(o, "CellAlarm");
-    for (int i = 0; i < cells && !r.err; i++)
-        cJSON_AddItemToArray(arr, cJSON_CreateString(alarm_name(hr_uint(&r, 1))));
-    int temps = (int)hr_uint(&r, 1);
-    add_int(o, "TemperatureCount", temps);
-    arr = cJSON_AddArrayToObject(o, "TemperatureAlarm");
-    for (int i = 0; i < temps && !r.err; i++)
-        cJSON_AddItemToArray(arr, cJSON_CreateString(alarm_name(hr_uint(&r, 1))));
-    cJSON_AddStringToObject(o, "ChargeCurrentAlarm", alarm_name(hr_uint(&r, 1)));
-    cJSON_AddStringToObject(o, "ModuleVoltageAlarm", alarm_name(hr_uint(&r, 1)));
-    cJSON_AddStringToObject(o, "DischargeCurrentAlarm", alarm_name(hr_uint(&r, 1)));
-    if (r.err) {
-        set_error("alarm info response too short (%zu characters)", len);
-        cJSON_Delete(o);
-        return NULL;
-    }
-    /* the status bytes are optional, only present in newer firmware */
-    for (int i = 1; i <= 5 && hr_available(&r, 1); i++) {
-        char name[16];
-        snprintf(name, sizeof(name), "Status%d", i);
-        add_int(o, name, (long)hr_uint(&r, 1));
-    }
-    return o;
-}
-
-/*
- * Decoded as in the protocol specification. python-pylontech is off by one
- * byte here (it misses the INFOFLAG), so its values are garbage.
- */
-static cJSON *decode_system_parameter(const char *payload, size_t len, int adr)
-{
-    hexrd_t r = { payload, len, 0, false };
-
-    if (len < 50) {
-        set_error("system parameter response too short (%zu characters)", len);
-        return NULL;
-    }
-    cJSON *o = cJSON_CreateObject();
-    add_int(o, "ADR", adr);
-    add_int(o, "InfoFlag", (long)hr_uint(&r, 1));
-    add_float(o, "CellHighVoltageLimit", cell_voltage(hr_int16(&r)));
-    add_float(o, "CellLowVoltageLimit", cell_voltage(hr_int16(&r)));
-    add_float(o, "CellUnderVoltageLimit", cell_voltage(hr_int16(&r)));
-    add_float(o, "ChargeHighTemperatureLimit", temperature(hr_int16(&r)));
-    add_float(o, "ChargeLowTemperatureLimit", temperature(hr_int16(&r)));
-    add_float(o, "ChargeCurrentLimit", module_current(hr_int16(&r)));
-    add_float(o, "ModuleHighVoltageLimit", module_voltage(hr_uint(&r, 2)));
-    add_float(o, "ModuleLowVoltageLimit", module_voltage(hr_uint(&r, 2)));
-    add_float(o, "ModuleUnderVoltageLimit", module_voltage(hr_uint(&r, 2)));
-    add_float(o, "DischargeHighTemperatureLimit", temperature(hr_int16(&r)));
-    add_float(o, "DischargeLowTemperatureLimit", temperature(hr_int16(&r)));
-    add_float(o, "DischargeCurrentLimit", module_current(hr_int16(&r)));
-    return o;
-}
-
-/*
- * Battery stack polling (like PylontechStack)
- */
-
-typedef struct {
-    transport_t tp;
-    cJSON *serials; /* NULL: not detected yet */
-    int battcount;
-} pylon_stack_t;
-
-static int battery_address(const config_t *cfg, int batt)
-{
-    return 2 + batt + (cfg->group << 4);
-}
-
-static bool battery_request(pylon_stack_t *st, const config_t *cfg, int batt, int cid2,
-                            int *resp_adr, char *payload, size_t size, size_t *plen)
-{
-    int adr = battery_address(cfg, batt);
-    char info[16];
-    snprintf(info, sizeof(info), "%02X%02X", adr & 0xff, (batt + 1) & 0xff);
-    return pylon_request(&st->tp, cfg->timeout, adr, cid2, info, resp_adr, payload, size, plen);
-}
-
-static bool poll_serial_number(pylon_stack_t *st, const config_t *cfg, int batt, char *out,
-                               size_t size)
-{
-    static char payload[FRAME_MAX];
-    size_t plen;
-    int adr;
-
-    if (!battery_request(st, cfg, batt, CID2_GET_SERIAL_NUMBER, &adr, payload, sizeof(payload),
-                         &plen))
-        return false;
-    if (plen < 34) {
-        set_error("serial number response too short (%zu characters)", plen);
-        return false;
-    }
-    hexrd_t r = { payload, plen, 2, false };
-    hr_ascii(&r, 16, out, size);
-    return true;
-}
-
-/* poll the serial numbers to find the batteries */
-static bool stack_detect(pylon_stack_t *st, const config_t *cfg)
-{
-    int limit = cfg->battery_count ? cfg->battery_count : MAX_BATTERIES;
-    cJSON *serials = cJSON_CreateArray();
-
-    for (int b = 0; b < limit; b++) {
-        char serial[32];
-        bool ok = false;
-        for (int retry = 0; retry < SERIAL_NUMBER_RETRIES && !ok && !g_stop; retry++) {
-            ok = poll_serial_number(st, cfg, b, serial, sizeof(serial));
-            if (!ok)
-                log_debug("Battery %d: serial number request failed: %s", b, g_error);
-        }
-        if (g_stop) {
-            cJSON_Delete(serials);
-            return false;
-        }
-        if (!ok) {
-            if (cfg->battery_count == 0 && b > 0)
-                break; /* auto detection: end of stack */
-            char msg[sizeof(g_error)];
-            snprintf(msg, sizeof(msg), "%s", g_error);
-            set_error("battery %d: serial number request failed: %s", b, msg);
-            cJSON_Delete(serials);
-            return false;
-        }
-        cJSON_AddItemToArray(serials, cJSON_CreateString(serial));
-        log_info("Battery %d: serial number %s", b, serial);
-    }
-
-    st->serials = serials;
-    st->battcount = cJSON_GetArraySize(serials);
-    log_info("number of batteries found: %d", st->battcount);
-    return true;
-}
-
-static void stack_forget(pylon_stack_t *st)
-{
-    cJSON_Delete(st->serials);
-    st->serials = NULL;
-    st->battcount = 0;
-}
-
-/* poll all batteries; returns the data tree or NULL (see g_error) */
-static cJSON *stack_update(pylon_stack_t *st, const config_t *cfg)
-{
-    static char payload[FRAME_MAX];
-    size_t plen;
-    int adr;
-    double total = 0, remain = 0, power = 0, cell_min = 0, cell_max = 0;
-    int cells = 0;
-
-    cJSON *root = cJSON_CreateObject();
-    cJSON_AddItemToObject(root, "SerialNumbers", cJSON_Duplicate(st->serials, true));
-    cJSON *analog = cJSON_AddArrayToObject(root, "Analog");
-    cJSON *charge = cJSON_AddArrayToObject(root, "ChargeDischargeManagement");
-    cJSON *alarm = cJSON_AddArrayToObject(root, "AlarmInfo");
-
-    for (int b = 0; b < st->battcount; b++) {
-        analog_summary_t sum;
-        cJSON *o;
-
-        if (!battery_request(st, cfg, b, CID2_GET_ANALOG_VALUE, &adr, payload, sizeof(payload),
-                             &plen) ||
-            !(o = decode_analog_value(payload, plen, adr, &sum)))
-            goto fail;
-        cJSON_AddItemToArray(analog, o);
-        remain += sum.remain;
-        total += sum.total;
-        power += sum.voltage * sum.current;
-        if (sum.cells > 0) {
-            if (cells == 0 || sum.cell_min < cell_min)
-                cell_min = sum.cell_min;
-            if (cells == 0 || sum.cell_max > cell_max)
-                cell_max = sum.cell_max;
-            cells += sum.cells;
-        }
-
-        if (!battery_request(st, cfg, b, CID2_GET_CHARGE_MANAGEMENT, &adr, payload,
-                             sizeof(payload), &plen) ||
-            !(o = decode_charge_management(payload, plen, adr)))
-            goto fail;
-        cJSON_AddItemToArray(charge, o);
-
-        if (!battery_request(st, cfg, b, CID2_GET_ALARM_INFO, &adr, payload, sizeof(payload),
-                             &plen) ||
-            !(o = decode_alarm_info(payload, plen, adr)))
-            goto fail;
-        cJSON_AddItemToArray(alarm, o);
-    }
-
-    cJSON *o;
-    if (!pylon_request(&st->tp, cfg->timeout, battery_address(cfg, 0), CID2_GET_SYSTEM_PARAMETER,
-                       "", &adr, payload, sizeof(payload), &plen) ||
-        !(o = decode_system_parameter(payload, plen, adr)))
-        goto fail;
-    cJSON_AddItemToObject(root, "SystemParameter", o);
-
-    cJSON *c = cJSON_AddObjectToObject(root, "Calculated");
-    add_float(c, "TotalCapacity_Ah", total);
-    add_float(c, "RemainCapacity_Ah", remain);
-    if (total > 0)
-        add_float(c, "Remain_Percent", py_round(remain / total * 100, 0));
-    else
-        cJSON_AddNullToObject(c, "Remain_Percent");
-    double power_w = py_round(power, 3);
-    add_float(c, "Power_W", power_w);
-    if (power_w > 0) {
-        add_float(c, "ChargePower_W", power_w);
-        add_int(c, "DischargePower_W", 0);
-    } else {
-        add_int(c, "ChargePower_W", 0);
-        add_float(c, "DischargePower_W", -1.0 * power_w);
-    }
-    if (cells > 0) {
-        add_float(c, "CellVoltageMin", cell_min);
-        add_float(c, "CellVoltageMax", cell_max);
-        add_float(c, "CellVoltageDelta", py_round(cell_max - cell_min, 3));
-    }
-    return root;
-
-fail:
-    cJSON_Delete(root);
-    return NULL;
 }
 
 /*
@@ -1931,13 +986,84 @@ static void export_file(const config_t *cfg, const cJSON *tree)
 }
 
 /*
+ * Data tree as cJSON, for the MQTT paths and the export file
+ */
+
+#define TREE_MAX_DEPTH 8
+
+typedef struct {
+    cJSON *root;
+    cJSON *stack[TREE_MAX_DEPTH];
+    int depth;
+} tree_builder_t;
+
+static void tree_node(void *ctx, const pylon_node_t *n)
+{
+    tree_builder_t *tb = ctx;
+    cJSON *item;
+
+    switch (n->type) {
+    case PYLON_NODE_END:
+        tb->depth--;
+        return;
+    case PYLON_NODE_OBJECT: item = cJSON_CreateObject(); break;
+    case PYLON_NODE_ARRAY: item = cJSON_CreateArray(); break;
+    case PYLON_NODE_INT: item = cJSON_CreateNumber((double)n->i); break;
+    /* floats are stored as raw JSON to keep the Python formatting ("6.0") */
+    case PYLON_NODE_FLOAT: item = cJSON_CreateRaw(n->text); break;
+    case PYLON_NODE_BOOL: item = cJSON_CreateBool(n->b); break;
+    case PYLON_NODE_STRING: item = cJSON_CreateString(n->s); break;
+    default: item = cJSON_CreateNull(); break;
+    }
+
+    if (tb->depth == 0)
+        tb->root = item;
+    else if (n->key)
+        cJSON_AddItemToObject(tb->stack[tb->depth - 1], n->key, item);
+    else
+        cJSON_AddItemToArray(tb->stack[tb->depth - 1], item);
+
+    if (n->type == PYLON_NODE_OBJECT || n->type == PYLON_NODE_ARRAY) {
+        if (tb->depth == TREE_MAX_DEPTH) {
+            log_error("Data tree too deep");
+            exit(1);
+        }
+        tb->stack[tb->depth++] = item;
+    }
+}
+
+static cJSON *data_tree(const pylon_data_t *data)
+{
+    tree_builder_t tb = { 0 };
+    pylon_data_walk(data, tree_node, &tb);
+    return tb.root;
+}
+
+/*
  * Main
  */
+
+static pylon_t *volatile g_pylon;
 
 static void signal_handler(int sig)
 {
     (void)sig;
     g_stop = 1;
+    if (g_pylon)
+        pylon_abort(g_pylon); /* interrupts a running poll */
+}
+
+static void pylon_log(void *ctx, int level, const char *msg)
+{
+    (void)ctx;
+    log_msg(level, "%s", msg);
+}
+
+static double now_monotonic(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
 }
 
 static void sleep_until(double deadline)
@@ -1980,11 +1106,34 @@ int main(int argc, char **argv)
         return EXIT_LOGGING;
     }
 
-    pylon_stack_t st = { .tp = { .fd = -1 } };
-    if (!transport_open(&st.tp, &cfg)) {
-        log_error("Could not open %s: %s", cfg.port, g_error);
+    pylon_config_t pcfg = {
+        .port = cfg.port,
+        .baudrate = cfg.baudrate,
+        .battery_count = cfg.battery_count,
+        .group = cfg.group,
+        .timeout = cfg.timeout,
+        .log = pylon_log,
+        .log_level = cfg.loglevel,
+    };
+    pylon_t *pylon = pylon_new(&pcfg);
+    pylon_data_t *data = malloc(sizeof(*data));
+    if (!pylon || !data) {
+        fprintf(stderr, "Could not initialize: %s\n", strerror(errno));
+        pylon_free(pylon);
+        config_free(&cfg);
+        return 1;
+    }
+    g_pylon = pylon;
+    if (g_stop)
+        pylon_abort(pylon);
+
+    if (pylon_connect(pylon) != PYLON_OK) {
+        log_error("Could not open %s: %s", cfg.port, pylon_error(pylon));
         if (g_log.fp != stderr)
-            fprintf(stderr, "Could not open %s: %s\n", cfg.port, g_error);
+            fprintf(stderr, "Could not open %s: %s\n", cfg.port, pylon_error(pylon));
+        g_pylon = NULL;
+        pylon_free(pylon);
+        free(data);
         config_free(&cfg);
         return 1;
     }
@@ -1992,7 +1141,7 @@ int main(int argc, char **argv)
     /* connect to mqtt broker */
     struct mosquitto *mosq = NULL;
     if (cfg.mqtt_server) {
-        /* keep signals away from the mosquitto thread, so they interrupt the serial poll */
+        /* keep signals away from the mosquitto thread, so they interrupt the main loop */
         sigset_t block, old;
         sigemptyset(&block);
         sigaddset(&block, SIGINT);
@@ -2001,7 +1150,9 @@ int main(int argc, char **argv)
         mosq = mqtt_start(&cfg);
         pthread_sigmask(SIG_SETMASK, &old, NULL);
         if (!mosq) {
-            transport_close(&st.tp);
+            g_pylon = NULL;
+            pylon_free(pylon);
+            free(data);
             config_free(&cfg);
             return EXIT_MQTT;
         }
@@ -2012,26 +1163,18 @@ int main(int argc, char **argv)
 
     while (!g_stop) {
         double start = now_monotonic();
-        cJSON *tree = NULL;
-        const char *what = NULL;
 
-        if (st.tp.fd < 0 && !transport_open(&st.tp, &cfg))
-            what = "Could not open port";
-        else if (!st.serials && !stack_detect(&st, &cfg))
-            what = "Pylontech detection error";
-        else if (!(tree = stack_update(&st, &cfg)))
-            what = "Pylontech update error";
-
-        if (g_stop) {
-            cJSON_Delete(tree);
+        /* on errors, the next update reconnects and detects the batteries again */
+        int rc = pylon_update(pylon, data);
+        if (g_stop)
             break;
-        }
 
-        if (tree) {
+        if (rc == PYLON_OK) {
             if (failures > 0)
                 log_info("Communication with battery restored after %d failed attempts", failures);
             failures = 0;
 
+            cJSON *tree = data_tree(data);
             if (g_log.level <= LVL_DEBUG) {
                 char *json = cJSON_PrintUnformatted(tree);
                 log_debug("data: %s", json ? json : "");
@@ -2044,12 +1187,9 @@ int main(int argc, char **argv)
             cJSON_Delete(tree);
         } else {
             if (failures++ == 0)
-                log_error("%s: %s", what, g_error);
+                log_error("%s: %s", pylon_strerror(rc), pylon_error(pylon));
             else
-                log_debug("%s: %s", what, g_error);
-            /* reconnect and detect the batteries again, like the Python version */
-            transport_close(&st.tp);
-            stack_forget(&st);
+                log_debug("%s: %s", pylon_strerror(rc), pylon_error(pylon));
         }
 
         sleep_until(start + cfg.interval);
@@ -2066,8 +1206,9 @@ int main(int argc, char **argv)
         mosquitto_destroy(mosq);
         mosquitto_lib_cleanup();
     }
-    transport_close(&st.tp);
-    stack_forget(&st);
+    g_pylon = NULL;
+    pylon_free(pylon);
+    free(data);
     for (size_t i = 0; i < g_last.n; i++) {
         free(g_last.v[i].topic);
         free(g_last.v[i].payload);

@@ -16,6 +16,10 @@ single small binary without a Python runtime.
 
 The protocol is the "PYLON low voltage Protocol RS485", version 3.3.
 
+The battery communication is also available as the shared library
+**libpylontech** (`pylontech.h`), for use in your own programs. It needs
+neither libmosquitto nor cJSON, only libc. See [Library](#library-libpylontech).
+
 ## Required Hardware
 
 - A USB to RS485 adapter (e.g. FTDI FT232R based). The adapter must switch
@@ -275,9 +279,14 @@ Build dependencies (Debian/Raspberry Pi OS):
 Build and install to `/usr/bin/pylon2mqtt`:
 
 ```
-make
+make pylon2mqtt
 sudo make install
 ```
+
+The library is compiled into `pylon2mqtt`, so the binary does not need
+`libpylontech.so`. `make` without a target builds both the binary and the
+library. To build only the library, which needs no extra packages, see
+[Library](#library-libpylontech).
 
 ## Installation
 
@@ -343,6 +352,151 @@ Then use `"port": "socket://127.0.0.1:5000"`. The `--pty` option creates a
 pseudo terminal instead and prints its device path, which tests the serial
 code path.
 
+## Library (libpylontech)
+
+`libpylontech` contains the battery communication of `pylon2mqtt`: serial
+and TCP transport, protocol, battery detection, decoding and the data tree.
+It has no dependencies besides libc and libm, and does no MQTT, config file
+handling or logging of its own.
+
+### Build and install
+
+```
+make lib                 # libpylontech.so.1.0.0 (+ symlinks), needs only build-essential
+sudo make install-lib    # library, pylontech.h and pylontech.pc
+sudo ldconfig
+```
+
+`install-lib` installs to `/usr/lib` and `/usr/include` by default; use
+`PREFIX`, `LIBDIR` and `INCLUDEDIR` to change that, e.g.
+`sudo make install-lib PREFIX=/usr/local` or
+`LIBDIR=/usr/lib/aarch64-linux-gnu` for Debian multiarch. `DESTDIR` is
+supported for packaging.
+
+Compile your program against it:
+
+```
+cc -o myprog myprog.c $(pkg-config --cflags --libs pylontech)
+# or without installing: cc -I. -o myprog myprog.c -L. -lpylontech
+```
+
+### Usage
+
+```c
+#include <stdio.h>
+#include <pylontech.h>
+
+int main(void)
+{
+    pylon_config_t cfg = { .port = "/dev/ttyUSB0" };   /* or "socket://host:port" */
+    pylon_t *p = pylon_new(&cfg);
+    static pylon_data_t data;
+
+    if (pylon_update(p, &data) == PYLON_OK) {
+        printf("%d batteries, %.0f %%, %.1f W\n", data.battery_count,
+               data.calculated.remain_percent, data.calculated.power);
+        printf("cell 1: %.3f V\n", data.batteries[0].analog.cell_voltages[0]);
+    } else {
+        fprintf(stderr, "error: %s\n", pylon_error(p));
+    }
+    pylon_free(p);
+    return 0;
+}
+```
+
+`examples/pylon_dump.c` is a complete example that prints a summary and the
+data tree as JSON (`make example`, then
+`LD_LIBRARY_PATH=. examples/pylon_dump socket://127.0.0.1:5000`).
+
+### API
+
+All functions and types are declared and documented in
+[`pylontech.h`](pylontech.h).
+
+| Function | Description |
+|---|---|
+| `pylon_new(&cfg)` | create a handle; the config is copied, the port is not opened yet. `NULL` on invalid config |
+| `pylon_update(p, &data)` | poll all batteries into `data`; opens the port and detects the batteries if needed |
+| `pylon_connect(p)` | open the port now (optional, `pylon_update()` does it), e.g. to check the port at startup |
+| `pylon_abort(p)` | make the running and all further `pylon_update()` calls return `PYLON_ERR_ABORTED`; safe from signal handlers and other threads |
+| `pylon_error(p)` | text of the last error, e.g. `no response from address 2 (timeout)` |
+| `pylon_strerror(rc)` | text of a return code |
+| `pylon_free(p)` | close the port and free the handle |
+| `pylon_data_json(&data)` | the data tree as compact JSON (free with `pylon_json_free()`) |
+| `pylon_data_walk(&data, fn, ctx)` | report the data tree node by node, e.g. to build your own JSON/dict structure |
+| `pylon_alarm_name(alarm)` | `Ok`, `BelowLimit`, `AboveLimit` or `OtherError` |
+
+`pylon_config_t` (all members except `port` may be 0 for the default):
+
+| Member | Default | Description |
+|---|---|---|
+| `port` | (required) | serial device or `socket://host:port` |
+| `baudrate` | `9600` | |
+| `battery_count` | `0` | `0` = auto detect |
+| `group` | `0` | battery group 0..7 |
+| `timeout` | `1` | seconds to wait for a response |
+| `log`, `log_ctx` | (none) | callback `void log(void *ctx, int level, const char *msg)` for the messages `pylon2mqtt` logs (port opened, serial numbers, protocol frames at `PYLON_LOG_DEBUG`) |
+| `log_level` | `0` | minimum level passed to `log` |
+
+`pylon_update()` returns `PYLON_OK` (0) or a negative error code:
+`PYLON_ERR_OPEN`, `PYLON_ERR_DETECT`, `PYLON_ERR_UPDATE` or
+`PYLON_ERR_ABORTED`. After an error the port is closed, and the next call
+reconnects and detects the batteries again, so you can simply call it
+periodically. A call takes a few hundred milliseconds per battery (more on
+timeouts); it blocks, so run it in its own thread if needed.
+
+`pylon_data_t` holds the decoded values as plain C structs: `batteries[i]`
+with `serial_number`, `analog`, `charge_management` and `alarm_info`, plus
+`system_parameter` and `calculated`, the same values as in the
+[data tree](#data-tree). Units are V, A, Ah, W and °C. Absent values (e.g.
+`remain_percent` with a total capacity of 0) are `NAN`. The struct has
+fixed size arrays (`PYLON_MAX_BATTERIES` = 16, `PYLON_MAX_CELLS` = 32,
+`PYLON_MAX_TEMPERATURES` = 16) and is about 12 KiB, so don't put it on
+small thread stacks.
+
+Thread safety: a handle must not be used by several threads at the same
+time, except `pylon_abort()`. Separate handles (e.g. for several stacks on
+different ports) are independent.
+
+### Use from other languages
+
+Via the JSON functions, the library is easy to use with an FFI, e.g.
+Python's `ctypes`:
+
+```python
+import ctypes, json
+
+lib = ctypes.CDLL("libpylontech.so.1")
+
+class Config(ctypes.Structure):
+    _fields_ = [("port", ctypes.c_char_p), ("baudrate", ctypes.c_int),
+                ("battery_count", ctypes.c_int), ("group", ctypes.c_int),
+                ("timeout", ctypes.c_double), ("log", ctypes.c_void_p),
+                ("log_ctx", ctypes.c_void_p), ("log_level", ctypes.c_int)]
+
+lib.pylon_new.restype = ctypes.c_void_p
+lib.pylon_new.argtypes = [ctypes.POINTER(Config)]
+lib.pylon_update.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+lib.pylon_error.restype = ctypes.c_char_p
+lib.pylon_error.argtypes = [ctypes.c_void_p]
+lib.pylon_data_json.restype = ctypes.c_void_p
+lib.pylon_data_json.argtypes = [ctypes.c_void_p]
+lib.pylon_json_free.argtypes = [ctypes.c_void_p]
+lib.pylon_free.argtypes = [ctypes.c_void_p]
+
+cfg = Config(port=b"/dev/ttyUSB0")
+p = lib.pylon_new(ctypes.byref(cfg))
+data = ctypes.create_string_buffer(64 * 1024)  # opaque, >= sizeof(pylon_data_t)
+if lib.pylon_update(p, data) != 0:
+    raise RuntimeError(lib.pylon_error(p).decode())
+s = lib.pylon_data_json(data)
+tree = json.loads(ctypes.string_at(s))
+lib.pylon_json_free(s)
+lib.pylon_free(p)
+
+print(tree["Calculated"]["Remain_Percent"], tree["Analog"][0]["CellVoltages"])
+```
+
 ## Credits
 
 The protocol handling (frame encoding, checksums, payload decoding) and the
@@ -356,6 +510,9 @@ pylon2mqtt is a C port of their work, not an independent implementation.
 
 pylon2mqtt is licensed under the GNU General Public License, version 3 or
 (at your option) any later version. See [LICENSE](LICENSE).
+
+This includes libpylontech: programs that link against it must be
+distributed under GPL-compatible terms.
 
 python-pylontech, from which the protocol handling is ported, is licensed
 under the MIT License. MIT is GPL compatible, which allows the port to be

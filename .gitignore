@@ -1,6 +1,9 @@
-# compiled binary
+# compiled binary and library
 /pylon2mqtt
 *.o
+/libpylontech.so*
+/pylontech.pc
+/examples/pylon_dump
 
 # debian package build output
 /dpkg/content/usr/

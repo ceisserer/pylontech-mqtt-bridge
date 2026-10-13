@@ -1,0 +1,9 @@
+prefix=@PREFIX@
+libdir=@LIBDIR@
+includedir=@INCLUDEDIR@
+
+Name: pylontech
+Description: Pylontech battery (RS485) protocol library
+Version: @VERSION@
+Libs: -L${libdir} -lpylontech
+Cflags: -I${includedir}
